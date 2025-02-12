@@ -1,35 +1,253 @@
 #!/usr/bin/env bash
 set -e
 
-echo "Hello gh-split-pr!"
+# Default values
+MAX_FILES=25
+GROUP_BY="directory"
 
-# Snippets to help get started:
+# Function to display usage information
+usage() {
+    echo "Usage: gh split-pr <pr-number> [--max-files=<number>] [--group-by=<strategy>]"
+    echo
+    echo "Options:"
+    echo "  --max-files    Maximum number of files per split PR (default: 10)"
+    echo "  --group-by     Strategy for grouping files (directory|extension|random) (default: directory)"
+    exit 1
+}
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --max-files=*)
+            MAX_FILES="${1#*=}"
+            shift
+            ;;
+        --group-by=*)
+            GROUP_BY="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [[ -z "$PR_NUMBER" ]]; then
+                PR_NUMBER="$1"
+            else
+                echo "Error: Unknown argument $1"
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+# Validate PR number
+if [[ -z "$PR_NUMBER" ]]; then
+    echo "Error: PR number is required"
+    usage
+fi
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+# Validate group-by strategy
+if [[ "$GROUP_BY" != "directory" && "$GROUP_BY" != "extension" && "$GROUP_BY" != "random" ]]; then
+    echo "Error: Invalid group-by strategy. Must be one of: directory, extension, random"
+    usage
+fi
+
+# Get the current repository
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+if [[ -z "$REPO" ]]; then
+    echo "Error: Not in a GitHub repository"
+    exit 1
+fi
+
+echo "Configuration:"
+echo "- PR Number: $PR_NUMBER"
+echo "- Max Files per PR: $MAX_FILES"
+echo "- Grouping Strategy: $GROUP_BY"
+echo "- Repository: $REPO"
+
+# Function to check if required commands are available
+check_dependencies() {
+    local missing_deps=()
+    for cmd in gh jq git; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}"
+        exit 1
+    fi
+}
+
+# Check dependencies before proceeding
+check_dependencies
+
+# Get PR details
+echo "Fetching PR #$PR_NUMBER details..."
+PR_DATA=$(gh pr view "$PR_NUMBER" --json title,body,baseRefName,headRefName,files)
+if [[ -z "$PR_DATA" ]]; then
+    echo "Error: Could not fetch PR #$PR_NUMBER"
+    exit 1
+fi
+
+# Extract PR information
+BASE_BRANCH=$(echo "$PR_DATA" | jq -r .baseRefName)
+HEAD_BRANCH=$(echo "$PR_DATA" | jq -r .headRefName)
+ORIGINAL_TITLE=$(echo "$PR_DATA" | jq -r .title)
+ORIGINAL_BODY=$(echo "$PR_DATA" | jq -r .body)
+
+# Get list of changed files
+FILES=$(echo "$PR_DATA" | jq -r '.files[].path')
+TOTAL_FILES=$(echo "$FILES" | wc -l)
+
+echo
+echo "PR Details:"
+echo "- Title: $ORIGINAL_TITLE"
+echo "- Base Branch: $BASE_BRANCH"
+echo "- Head Branch: $HEAD_BRANCH"
+echo "- Total Files Changed: $TOTAL_FILES"
+
+# Function to group files based on strategy
+group_files() {
+    local files="$1"
+    case "$GROUP_BY" in
+        "directory")
+            # Group by top-level directory
+            echo "$files" | awk -F'/' '{
+                if (NF > 1) print $1, $0
+                else print "root", $0
+            }' | sort | cut -d' ' -f2-
+            ;;
+        "extension")
+            # Group by file extension
+            echo "$files" | awk -F'.' '{
+                if (NF > 1) print $NF, $0
+                else print "no_ext", $0
+            }' | sort | cut -d' ' -f2-
+            ;;
+        "random")
+            # Random distribution
+            echo "$files" | shuf
+            ;;
+    esac
+}
+
+# Create temporary directory for file operations
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+# Group the files
+echo "Grouping files by $GROUP_BY..."
+GROUPED_FILES=$(group_files "$FILES")
+
+# Initialize counters and arrays
+CURRENT_COUNT=0
+BATCH_NUMBER=1
+declare -a NEW_PRS=()
+
+# Function to create a new PR
+create_split_pr() {
+    local batch_num=$1
+    local files_list=$2
+    
+    echo "Creating PR batch $batch_num with $(echo "$files_list" | wc -l) files..."
+    
+    # Create new branch for this batch
+    local batch_branch="split-pr-$PR_NUMBER-batch-$batch_num"
+    git checkout -b "$batch_branch" "origin/$BASE_BRANCH"
+    
+    # Copy files from original PR
+    while IFS= read -r file; do
+        # Create directory structure if needed
+        mkdir -p "$TEMP_DIR/$(dirname "$file")"
+        # Get file content from original PR branch
+        git show "origin/$HEAD_BRANCH:$file" > "$TEMP_DIR/$file" || {
+            echo "Warning: Could not get content for $file"
+            continue
+        }
+    done <<< "$files_list"
+    
+    # Copy files to working directory
+    cp -r "$TEMP_DIR"/* . || true
+    
+    # Stage and commit changes
+    git add .
+    git commit -m "Split PR #$PR_NUMBER - Batch $batch_num
+
+Part of original PR: #$PR_NUMBER
+Files in this batch: $(echo "$files_list" | wc -l)"
+    
+    # Push branch
+    git push origin "$batch_branch"
+    
+    # Create PR
+    local pr_url=$(gh pr create \
+        --title "[$batch_num] $ORIGINAL_TITLE" \
+        --body "Part $batch_num of original PR #$PR_NUMBER
+
+This PR contains a subset of changes from the original PR #$PR_NUMBER.
+
+## Files in this batch:
+$(echo "$files_list" | sed 's/^/- /')
+
+---
+
+Original description:
+$ORIGINAL_BODY" \
+        --base "$BASE_BRANCH" \
+        --head "$batch_branch")
+    
+    echo "$pr_url"
+}
+
+echo "Preparing to split PR into batches of up to $MAX_FILES files..."
+echo "Total files to process: $TOTAL_FILES"
+
+
+# Process files in batches
+current_batch=""
+while IFS= read -r file; do
+    current_batch+="$file"$'\n'
+    CURRENT_COUNT=$((CURRENT_COUNT + 1))
+    
+    if [[ $CURRENT_COUNT -eq $MAX_FILES ]]; then
+        # Create PR for current batch
+        NEW_PR_URL=$(create_split_pr "$BATCH_NUMBER" "$current_batch")
+        NEW_PRS+=("$NEW_PR_URL")
+        
+        # Reset for next batch
+        current_batch=""
+        CURRENT_COUNT=0
+        BATCH_NUMBER=$((BATCH_NUMBER + 1))
+        rm -rf "$TEMP_DIR"/*
+    fi
+done <<< "$GROUPED_FILES"
+
+# Handle remaining files if any
+if [[ -n "$current_batch" ]]; then
+    NEW_PR_URL=$(create_split_pr "$BATCH_NUMBER" "$current_batch")
+    NEW_PRS+=("$NEW_PR_URL")
+fi
+
+# Update original PR with links to new PRs
+echo "Updating original PR with links to new PRs..."
+NEW_PR_LINKS=""
+for pr in "${NEW_PRS[@]}"; do
+    NEW_PR_LINKS+="- $pr"$'\n'
+done
+
+gh pr edit "$PR_NUMBER" --body "This PR has been split into smaller PRs:
+
+$NEW_PR_LINKS
+---
+
+Original description:
+$ORIGINAL_BODY"
+
+echo
+echo "Successfully split PR #$PR_NUMBER into ${#NEW_PRS[@]} smaller PRs:"
+for pr in "${NEW_PRS[@]}"; do
+    echo "- $pr"
+done
