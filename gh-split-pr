@@ -142,6 +142,60 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 echo "Grouping files by $GROUP_BY..."
 GROUPED_FILES=$(group_files "$FILES")
 
+# Function to preview the split
+preview_split() {
+    local files="$1"
+    local batch_size="$2"
+    local current_count=0
+    local batch_number=1
+    local current_batch=""
+    
+    echo "Preview of PR split:"
+    echo "-------------------"
+    echo "Using strategy: $GROUP_BY"
+    echo "Maximum files per PR: $batch_size"
+    echo
+    
+    while IFS= read -r file; do
+        current_batch+="$file"$'\n'
+        current_count=$((current_count + 1))
+        
+        if [[ $current_count -eq $batch_size ]]; then
+            echo "Batch $batch_number (${current_count} files):"
+            echo "$current_batch"
+            echo "-------------------"
+            
+            current_batch=""
+            current_count=0
+            batch_number=$((batch_number + 1))
+        fi
+    done <<< "$files"
+    
+    # Handle remaining files if any
+    if [[ -n "$current_batch" ]]; then
+        echo "Batch $batch_number ($current_count files):"
+        echo "$current_batch"
+        echo "-------------------"
+    fi
+    
+    echo
+    echo "Total number of PRs that will be created: $((batch_number))"
+}
+
+echo "Preparing to split PR into batches of up to $MAX_FILES files..."
+echo "Total files to process: $TOTAL_FILES"
+
+# Preview the split
+preview_split "$GROUPED_FILES" "$MAX_FILES"
+
+# Ask for user confirmation
+read -p "Do you want to proceed with this split? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Operation cancelled by user"
+    exit 0
+fi
+
 # Initialize counters and arrays
 CURRENT_COUNT=0
 BATCH_NUMBER=1
@@ -201,10 +255,6 @@ $ORIGINAL_BODY" \
     
     echo "$pr_url"
 }
-
-echo "Preparing to split PR into batches of up to $MAX_FILES files..."
-echo "Total files to process: $TOTAL_FILES"
-
 
 # Process files in batches
 current_batch=""
