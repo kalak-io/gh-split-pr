@@ -1,19 +1,42 @@
 #!/usr/bin/env bash
 set -e
 
+# Function to check if required commands are available
+check_dependencies() {
+    local missing_deps=()
+    for cmd in gh jq git; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}"
+        exit 1
+    fi
+    echo "Dependencies checked successfully!"
+    echo
+}
+
+# Check dependencies before proceeding
+echo
+check_dependencies
+
 # Default values
 MAX_FILES=25
 GROUP_BY="directory"
 WITH_AI=""
+INPLACE=false
 
 # Function to display usage information
 usage() {
-    echo "Usage: gh split-pr <pr-number> [--max-files=<number>] [--group-by=<strategy>] [--with=<source>]"
+    echo "Usage: gh split-pr <pr-number> [--max-files=<number>] [--group-by=<strategy>] [--with=<source>] [--inplace]"
     echo
     echo "Options:"
     echo "  --max-files    Maximum number of files per split PR (default: 10)"
     echo "  --group-by     Strategy for grouping files (directory|extension|random|ai) (default: directory)"
     echo "  --with        AI source for advanced grouping (OPENAI|CLAUDE|DEEPSEEK)"
+    echo "  --inplace     Modify the original PR instead of creating new PRs"
     exit 1
 }
 
@@ -39,75 +62,6 @@ validate_ai_source() {
     esac
 }
 
-# Function to call AI API for file grouping
-group_files_with_ai() {
-    local files="$1"
-    local source="$2"
-    local api_key_var="${source}_API_KEY"
-    local api_key="${!api_key_var}"
-    local response=""
-
-    # Prepare prompt for AI
-    local prompt="You are an expert at organizing code files into logical, cohesive groups for pull requests.
-
-Given the following list of files, suggest how to split them into smaller, meaningful PRs:
-
-$files
-
-Provide your response as a JSON array of arrays, where each inner array represents a group of files that should be in the same PR.
-Reasoning should focus on:
-1. Logical code organization
-2. Minimal interdependencies between groups
-3. Maintaining clear, focused PRs
-
-Example output format:
-[
-    ['src/module1/file1.py', 'src/module1/file2.py'],
-    ['src/module2/file3.js', 'src/module2/file4.js']
-]"
-
-    # Call different AI APIs based on source
-    case "$source" in
-        OPENAI)
-            response=$(curl -s https://api.openai.com/v1/chat/completions \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $api_key" \
-                -d "{
-                    \"model\": \"gpt-3.5-turbo\",
-                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
-                    \"temperature\": 0.7
-                }" | jq -r '.choices[0].message.content')
-            ;;
-        CLAUDE)
-            response=$(curl -s https://api.anthropic.com/v1/messages \
-                -H "Content-Type: application/json" \
-                -H "X-API-Key: $api_key" \
-                -d "{
-                    \"model\": \"claude-2.1\",
-                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}]
-                }" | jq -r '.content[0].text')
-            ;;
-        DEEPSEEK)
-            response=$(curl -s https://api.deepseek.com/v1/chat/completions \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $api_key" \
-                -d "{
-                    \"model\": \"deepseek-chat\",
-                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
-                    \"temperature\": 0.7
-                }" | jq -r '.choices[0].message.content')
-            ;;
-    esac
-
-    # Validate and parse JSON response
-    if echo "$response" | jq -e . >/dev/null 2>&1; then
-        echo "$response"
-    else
-        # Fallback to default grouping if AI response is invalid
-        echo "$files" | awk -F'/' '{print $1, $0}' | sort | cut -d' ' -f2-
-    fi
-}
-
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -122,6 +76,10 @@ while [[ $# -gt 0 ]]; do
         --with=*)
             WITH_AI="${1#*=}"
             validate_ai_source "$WITH_AI"
+            shift
+            ;;
+        --inplace)
+            INPLACE=true
             shift
             ;;
         -h|--help)
@@ -164,34 +122,18 @@ if [[ -z "$REPO" ]]; then
     exit 1
 fi
 
-echo "Configuration:"
-echo "- PR Number: $PR_NUMBER"
+echo "##### CONFIGURATION #####"
+echo "- Repository: $REPO"
+echo "- PR Number: #$PR_NUMBER"
 echo "- Max Files per PR: $MAX_FILES"
 echo "- Grouping Strategy: $GROUP_BY"
 if [[ -n "$WITH_AI" ]]; then
     echo "- AI Source: $WITH_AI"
 fi
-echo "- Repository: $REPO"
-
-# Function to check if required commands are available
-check_dependencies() {
-    local missing_deps=()
-    for cmd in gh jq git; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing_deps+=("$cmd")
-        fi
-    done
-
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        echo "Error: Missing required dependencies: ${missing_deps[*]}"
-        exit 1
-    fi
-}
-
-# Check dependencies before proceeding
-check_dependencies
+echo "- Modification Mode: $( [[ "$INPLACE" == true ]] && echo "In-place" || echo "Create New PRs" )"
 
 # Get PR details
+echo
 echo "Fetching PR #$PR_NUMBER details..."
 PR_DATA=$(gh pr view "$PR_NUMBER" --json title,body,baseRefName,headRefName,files)
 if [[ -z "$PR_DATA" ]]; then
@@ -210,11 +152,127 @@ FILES=$(echo "$PR_DATA" | jq -r '.files[].path')
 TOTAL_FILES=$(echo "$FILES" | wc -l)
 
 echo
-echo "PR Details:"
+echo "##### PR DETAILS #####"
 echo "- Title: $ORIGINAL_TITLE"
 echo "- Base Branch: $BASE_BRANCH"
 echo "- Head Branch: $HEAD_BRANCH"
 echo "- Total Files Changed: $TOTAL_FILES"
+if [[ $TOTAL_FILES -lt 10 ]]; then
+    echo "- Files Changed:"
+    echo "$FILES" | sed 's/^/  - /'
+fi
+
+# Function to call AI API for file grouping
+ask_to_ai() {
+    local files="$1"
+    local source="$2"
+    local api_key_var="${source}_API_KEY"
+    local api_key="${!api_key_var}"
+    local response=""
+
+    # Prepare prompt for AI
+    local prompt="You are an expert at organizing code files into logical, cohesive groups for pull requests.
+
+Given the following list of files, suggest how to split them into smaller, meaningful PRs:
+
+$files
+
+First, explain your reasoning for how you plan to group these files. Then, provide your response as a JSON object with two fields:
+1. 'explanation': A string explaining your grouping strategy and rationale
+2. 'groups': An array of arrays where each inner array represents a group of files that should be in the same PR
+
+Your grouping should focus on:
+1. Logical code organization
+2. Minimal interdependencies between groups
+3. Maintaining clear, focused PRs
+
+Example output format:
+{
+    \"explanation\": \"I grouped the files based on their functional areas. The first group contains core module files, while the second group contains utility functions.\",
+    \"groups\": [
+        [\"src/module1/file1.py\", \"src/module1/file2.py\"],
+        [\"src/module2/file3.js\", \"src/module2/file4.js\"]
+    ]
+}"
+
+    # Call different AI APIs based on source
+    case "$source" in
+        OPENAI)
+            response=$(curl -s https://api.openai.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $api_key" \
+                -d "{
+                    \"model\": \"gpt-3.5-turbo\",
+                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
+                    \"temperature\": 0.7
+                }" | jq -r '.choices[0].message.content')
+            ;;
+        CLAUDE)
+            response=$(curl https://api.anthropic.com/v1/messages \
+                    --header "x-api-key: $ANTHROPIC_API_KEY" \
+                    --header "anthropic-version: 2023-06-01" \
+                    --header "content-type: application/json" \
+                    --data \
+                "{
+                    \"model\": \"claude-3-5-sonnet-20241022\",
+                    \"max_tokens\": 1024,
+                    \"messages\": [
+                        {\"role\": \"user\", \"content\": \"$prompt\"}
+                    ],
+                    \"temperature\": 0.7
+                }" | jq -r '.content[0].text')
+            ;;
+        DEEPSEEK)
+            response=$(curl -s https://api.deepseek.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $api_key" \
+                -d "{
+                    \"model\": \"deepseek-chat\",
+                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
+                    \"temperature\": 0.7
+                }" | jq -r '.choices[0].message.content')
+            ;;
+    esac
+
+    # Validate and parse JSON response
+    local parsed_response
+    parsed_response=$(echo "$response" | jq -c '.' 2>/dev/null)
+
+    if [[ -n "$parsed_response" && "$parsed_response" != "null" ]]; then
+        # Display AI's explanation
+        echo "AI Grouping Strategy:"
+        echo "-----------------------------------"
+        echo "$(echo "$parsed_response" | jq -r '.explanation')"
+        echo "-----------------------------------"
+        echo
+
+        # Preview AI-generated groups
+        echo "AI-Generated File Groups:"
+        echo "-----------------------------------"
+        local group_count=1
+        echo "$parsed_response" | jq -r '.groups[]' | while read -r group; do
+            echo "Group $group_count:"
+            echo "$group" | jq -r '.[]'
+            echo "-----------------------------------"
+            ((group_count++))
+        done
+
+        # Ask for user confirmation
+        read -p "Do you want to proceed with this AI-generated grouping? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled by user"
+            exit 0
+        fi
+
+        # Return just the groups array for further processing
+        echo "$parsed_response" | jq -c '.groups'
+    else
+        # Fallback to default grouping if AI response is invalid
+        echo "AI grouping failed. Falling back to default directory grouping."
+        echo "$files" | awk -F'/' '{print $1, $0}' | sort | cut -d' ' -f2-
+    fi
+}
 
 # Function to group files based on strategy
 group_files() {
@@ -222,7 +280,7 @@ group_files() {
 
     # If AI grouping is selected, use AI-powered grouping
     if [[ "$GROUP_BY" == "ai" && -n "$WITH_AI" ]]; then
-        group_files_with_ai "$files" "$WITH_AI"
+        ask_to_ai "$files" "$WITH_AI"
         return
     fi
 
@@ -255,14 +313,6 @@ group_files() {
             ;;
     esac
 }
-
-# Create temporary directory for file operations
-TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
-
-# Group the files
-echo "Grouping files by $GROUP_BY..."
-GROUPED_FILES=$(group_files "$FILES")
 
 # Function to preview the split
 preview_split() {
@@ -307,6 +357,8 @@ preview_split() {
 echo "Preparing to split PR into batches of up to $MAX_FILES files..."
 echo "Total files to process: $TOTAL_FILES"
 
+GROUPED_FILES=$(group_files "$FILES")
+
 # Preview the split
 preview_split "$GROUPED_FILES" "$MAX_FILES"
 
@@ -318,11 +370,6 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# Initialize counters and arrays
-CURRENT_COUNT=0
-BATCH_NUMBER=1
-declare -a NEW_PRS=()
-
 # Function to create a new PR
 create_split_pr() {
     local batch_num=$1
@@ -330,9 +377,34 @@ create_split_pr() {
 
     echo "Creating PR batch $batch_num with $(echo "$files_list" | wc -l) files..."
 
-    # Create new branch for this batch
-    local batch_branch="split-pr-$PR_NUMBER-batch-$batch_num"
-    git checkout -b "$batch_branch" "origin/$BASE_BRANCH"
+    # Determine branch and PR creation strategy
+    local batch_branch
+    local pr_title
+    local pr_body
+
+    if [[ "$INPLACE" == true ]]; then
+        # In-place modification: use the same branch
+        batch_branch="$HEAD_BRANCH"
+        pr_title="$ORIGINAL_TITLE"
+        pr_body="$ORIGINAL_BODY
+
+## Files modified in this batch:
+$(echo "$files_list" | sed 's/^/- /')"
+    else
+        # Create new branch for this batch
+        batch_branch="split-pr-$PR_NUMBER-batch-$batch_num"
+        git checkout -b "$batch_branch" "origin/$BASE_BRANCH"
+        pr_title="[$batch_num] $ORIGINAL_TITLE"
+        pr_body="Part $batch_num of original PR #$PR_NUMBER
+
+## Files in this batch:
+$(echo "$files_list" | sed 's/^/- /')
+
+---
+
+Original description:
+$ORIGINAL_BODY"
+    fi
 
     # Copy files from original PR
     while IFS= read -r file; do
@@ -352,32 +424,36 @@ create_split_pr() {
     git add .
     git commit -m "Split PR #$PR_NUMBER - Batch $batch_num
 
-Part of original PR: #$PR_NUMBER
+$( [[ "$INPLACE" == true ]] && echo "Modified files for in-place update" || echo "Part of original PR: #$PR_NUMBER" )
 Files in this batch: $(echo "$files_list" | wc -l)"
 
     # Push branch
-    git push origin "$batch_branch"
+    if [[ "$INPLACE" == false ]]; then
+        git push origin "$batch_branch"
+    else
+        git push origin "$batch_branch" --force
+    fi
 
-    # Create PR
-    local pr_url=""
-    pr_url=$(gh pr create \
-        --title "[$batch_num] $ORIGINAL_TITLE" \
-        --body "Part $batch_num of original PR #$PR_NUMBER
+    # Create PR or update existing PR
+    if [[ "$INPLACE" == false ]]; then
+        local pr_url=$(gh pr create \
+            --title "$pr_title" \
+            --body "$pr_body" \
+            --base "$BASE_BRANCH" \
+            --head "$batch_branch")
 
-This PR contains a subset of changes from the original PR #$PR_NUMBER.
-
-## Files in this batch:
-$(echo "$files_list" | sed 's/^/- /')
-
----
-
-Original description:
-$ORIGINAL_BODY" \
-        --base "$BASE_BRANCH" \
-        --head "$batch_branch")
-
-    echo "$pr_url"
+        echo "$pr_url"
+    else
+        # Update the existing PR
+        gh pr edit "$PR_NUMBER" --title "$pr_title" --body "$pr_body"
+        echo "$PR_NUMBER"
+    fi
 }
+
+# Initialize counters and arrays
+CURRENT_COUNT=0
+BATCH_NUMBER=1
+declare -a NEW_PRS=()
 
 # Process files in batches
 current_batch=""
@@ -410,23 +486,24 @@ if [[ -n "$current_batch" ]]; then
     NEW_PRS+=("$new_pr_url")
 fi
 
-# Update original PR with links to new PRs
-echo "Updating original PR with links to new PRs..."
-NEW_PR_LINKS=""
-for pr in "${NEW_PRS[@]}"; do
-    NEW_PR_LINKS+="- $pr"$'\n'
-done
+# Update original PR with links to new PRs (if not in-place)
+if [[ "$INPLACE" == false ]]; then
+    # Update original PR with links to new PRs
+    echo "Updating original PR with links to new PRs..."
+    NEW_PR_LINKS=""
+    for pr in "${NEW_PRS[@]}"; do
+        NEW_PR_LINKS+="- $pr"$'\n'
+    done
 
-gh pr edit "$PR_NUMBER" --body "This PR has been split into smaller PRs:
+    gh pr edit "$PR_NUMBER" --body "This PR has been split into smaller PRs:
 
 $NEW_PR_LINKS
 ---
 
 Original description:
 $ORIGINAL_BODY"
-
-echo
-echo "Successfully split PR #$PR_NUMBER into ${#NEW_PRS[@]} smaller PRs:"
-for pr in "${NEW_PRS[@]}"; do
-    echo "- $pr"
-done
+    echo "Successfully split PR #$PR_NUMBER into ${#NEW_PRS[@]} smaller PRs:"
+    for pr in "${NEW_PRS[@]}"; do
+        echo "- $pr"
+    done
+fi
