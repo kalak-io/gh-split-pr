@@ -4,15 +4,108 @@ set -e
 # Default values
 MAX_FILES=25
 GROUP_BY="directory"
+WITH_AI=""
 
 # Function to display usage information
 usage() {
-    echo "Usage: gh split-pr <pr-number> [--max-files=<number>] [--group-by=<strategy>]"
+    echo "Usage: gh split-pr <pr-number> [--max-files=<number>] [--group-by=<strategy>] [--with=<source>]"
     echo
     echo "Options:"
     echo "  --max-files    Maximum number of files per split PR (default: 10)"
-    echo "  --group-by     Strategy for grouping files (directory|extension|random) (default: directory)"
+    echo "  --group-by     Strategy for grouping files (directory|extension|random|ai) (default: directory)"
+    echo "  --with        AI source for advanced grouping (OPENAI|CLAUDE|DEEPSEEK)"
     exit 1
+}
+
+# Function to validate and check AI API key
+validate_ai_source() {
+    local source="$1"
+    local api_key_var
+
+    # Validate AI source
+    case "$source" in
+        OPENAI|CLAUDE|DEEPSEEK)
+            # Check if API key is set
+            api_key_var="${source}_API_KEY"
+            if [[ -z "${!api_key_var}" ]]; then
+                echo "Error: ${api_key_var} environment variable is required."
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Error: Unsupported AI source. Supported sources are: OPENAI, CLAUDE, DEEPSEEK"
+            exit 1
+            ;;
+    esac
+}
+
+# Function to call AI API for file grouping
+group_files_with_ai() {
+    local files="$1"
+    local source="$2"
+    local api_key_var="${source}_API_KEY"
+    local api_key="${!api_key_var}"
+    local response=""
+
+    # Prepare prompt for AI
+    local prompt="You are an expert at organizing code files into logical, cohesive groups for pull requests.
+
+Given the following list of files, suggest how to split them into smaller, meaningful PRs:
+
+$files
+
+Provide your response as a JSON array of arrays, where each inner array represents a group of files that should be in the same PR.
+Reasoning should focus on:
+1. Logical code organization
+2. Minimal interdependencies between groups
+3. Maintaining clear, focused PRs
+
+Example output format:
+[
+    ['src/module1/file1.py', 'src/module1/file2.py'],
+    ['src/module2/file3.js', 'src/module2/file4.js']
+]"
+
+    # Call different AI APIs based on source
+    case "$source" in
+        OPENAI)
+            response=$(curl -s https://api.openai.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $api_key" \
+                -d "{
+                    \"model\": \"gpt-3.5-turbo\",
+                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
+                    \"temperature\": 0.7
+                }" | jq -r '.choices[0].message.content')
+            ;;
+        CLAUDE)
+            response=$(curl -s https://api.anthropic.com/v1/messages \
+                -H "Content-Type: application/json" \
+                -H "X-API-Key: $api_key" \
+                -d "{
+                    \"model\": \"claude-2.1\",
+                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}]
+                }" | jq -r '.content[0].text')
+            ;;
+        DEEPSEEK)
+            response=$(curl -s https://api.deepseek.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $api_key" \
+                -d "{
+                    \"model\": \"deepseek-chat\",
+                    \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
+                    \"temperature\": 0.7
+                }" | jq -r '.choices[0].message.content')
+            ;;
+    esac
+
+    # Validate and parse JSON response
+    if echo "$response" | jq -e . >/dev/null 2>&1; then
+        echo "$response"
+    else
+        # Fallback to default grouping if AI response is invalid
+        echo "$files" | awk -F'/' '{print $1, $0}' | sort | cut -d' ' -f2-
+    fi
 }
 
 # Parse command line arguments
@@ -24,6 +117,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --group-by=*)
             GROUP_BY="${1#*=}"
+            shift
+            ;;
+        --with=*)
+            WITH_AI="${1#*=}"
+            validate_ai_source "$WITH_AI"
             shift
             ;;
         -h|--help)
@@ -48,8 +146,14 @@ if [[ -z "$PR_NUMBER" ]]; then
 fi
 
 # Validate group-by strategy
-if [[ "$GROUP_BY" != "directory" && "$GROUP_BY" != "extension" && "$GROUP_BY" != "random" ]]; then
-    echo "Error: Invalid group-by strategy. Must be one of: directory, extension, random"
+if [[ "$GROUP_BY" == "ai" && -z "$WITH_AI" ]]; then
+    echo "Error: AI grouping strategy requires specifying an AI source with --with=<source>"
+    echo "Available sources: OPENAI, CLAUDE, DEEPSEEK"
+    exit 1
+fi
+
+if [[ "$GROUP_BY" != "directory" && "$GROUP_BY" != "extension" && "$GROUP_BY" != "random" && "$GROUP_BY" != "ai" ]]; then
+    echo "Error: Invalid group-by strategy. Must be one of: directory, extension, random, ai"
     usage
 fi
 
@@ -64,6 +168,9 @@ echo "Configuration:"
 echo "- PR Number: $PR_NUMBER"
 echo "- Max Files per PR: $MAX_FILES"
 echo "- Grouping Strategy: $GROUP_BY"
+if [[ -n "$WITH_AI" ]]; then
+    echo "- AI Source: $WITH_AI"
+fi
 echo "- Repository: $REPO"
 
 # Function to check if required commands are available
@@ -112,6 +219,14 @@ echo "- Total Files Changed: $TOTAL_FILES"
 # Function to group files based on strategy
 group_files() {
     local files="$1"
+
+    # If AI grouping is selected, use AI-powered grouping
+    if [[ "$GROUP_BY" == "ai" && -n "$WITH_AI" ]]; then
+        group_files_with_ai "$files" "$WITH_AI"
+        return
+    fi
+
+    # Default grouping strategies
     case "$GROUP_BY" in
         "directory")
             # Group by top-level directory
@@ -130,6 +245,13 @@ group_files() {
         "random")
             # Random distribution
             echo "$files" | shuf
+            ;;
+        *)
+            # Default to directory if unknown strategy
+            echo "$files" | awk -F'/' '{
+                if (NF > 1) print $1, $0
+                else print "root", $0
+            }' | sort | cut -d' ' -f2-
             ;;
     esac
 }
