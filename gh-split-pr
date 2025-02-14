@@ -74,7 +74,7 @@ check_dependencies() {
             missing_deps+=("$cmd")
         fi
     done
-    
+
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         echo "Error: Missing required dependencies: ${missing_deps[*]}"
         exit 1
@@ -149,35 +149,35 @@ preview_split() {
     local current_count=0
     local batch_number=1
     local current_batch=""
-    
+
     echo "Preview of PR split:"
     echo "-------------------"
     echo "Using strategy: $GROUP_BY"
     echo "Maximum files per PR: $batch_size"
     echo
-    
+
     while IFS= read -r file; do
         current_batch+="$file"$'\n'
         current_count=$((current_count + 1))
-        
+
         if [[ $current_count -eq $batch_size ]]; then
             echo "Batch $batch_number (${current_count} files):"
             echo "$current_batch"
             echo "-------------------"
-            
+
             current_batch=""
             current_count=0
             batch_number=$((batch_number + 1))
         fi
     done <<< "$files"
-    
+
     # Handle remaining files if any
     if [[ -n "$current_batch" ]]; then
         echo "Batch $batch_number ($current_count files):"
         echo "$current_batch"
         echo "-------------------"
     fi
-    
+
     echo
     echo "Total number of PRs that will be created: $((batch_number))"
 }
@@ -205,13 +205,13 @@ declare -a NEW_PRS=()
 create_split_pr() {
     local batch_num=$1
     local files_list=$2
-    
+
     echo "Creating PR batch $batch_num with $(echo "$files_list" | wc -l) files..."
-    
+
     # Create new branch for this batch
     local batch_branch="split-pr-$PR_NUMBER-batch-$batch_num"
     git checkout -b "$batch_branch" "origin/$BASE_BRANCH"
-    
+
     # Copy files from original PR
     while IFS= read -r file; do
         # Create directory structure if needed
@@ -222,22 +222,23 @@ create_split_pr() {
             continue
         }
     done <<< "$files_list"
-    
+
     # Copy files to working directory
     cp -r "$TEMP_DIR"/* . || true
-    
+
     # Stage and commit changes
     git add .
     git commit -m "Split PR #$PR_NUMBER - Batch $batch_num
 
 Part of original PR: #$PR_NUMBER
 Files in this batch: $(echo "$files_list" | wc -l)"
-    
+
     # Push branch
     git push origin "$batch_branch"
-    
+
     # Create PR
-    local pr_url=$(gh pr create \
+    local pr_url=""
+    pr_url=$(gh pr create \
         --title "[$batch_num] $ORIGINAL_TITLE" \
         --body "Part $batch_num of original PR #$PR_NUMBER
 
@@ -252,7 +253,7 @@ Original description:
 $ORIGINAL_BODY" \
         --base "$BASE_BRANCH" \
         --head "$batch_branch")
-    
+
     echo "$pr_url"
 }
 
@@ -261,24 +262,30 @@ current_batch=""
 while IFS= read -r file; do
     current_batch+="$file"$'\n'
     CURRENT_COUNT=$((CURRENT_COUNT + 1))
-    
+
     if [[ $CURRENT_COUNT -eq $MAX_FILES ]]; then
         # Create PR for current batch
-        NEW_PR_URL=$(create_split_pr "$BATCH_NUMBER" "$current_batch")
-        NEW_PRS+=("$NEW_PR_URL")
-        
+        new_pr_url=""
+        new_pr_url=$(create_split_pr "$BATCH_NUMBER" "$current_batch")
+        NEW_PRS+=("$new_pr_url")
+
         # Reset for next batch
         current_batch=""
         CURRENT_COUNT=0
         BATCH_NUMBER=$((BATCH_NUMBER + 1))
-        rm -rf "$TEMP_DIR"/*
+
+        # Safely remove contents of temp directory
+        if [[ -n "${TEMP_DIR:?}" ]]; then
+            rm -rf "${TEMP_DIR:?}"/*
+        fi
     fi
 done <<< "$GROUPED_FILES"
 
 # Handle remaining files if any
 if [[ -n "$current_batch" ]]; then
-    NEW_PR_URL=$(create_split_pr "$BATCH_NUMBER" "$current_batch")
-    NEW_PRS+=("$NEW_PR_URL")
+    new_pr_url=""
+    new_pr_url=$(create_split_pr "$BATCH_NUMBER" "$current_batch")
+    NEW_PRS+=("$new_pr_url")
 fi
 
 # Update original PR with links to new PRs
