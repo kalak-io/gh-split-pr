@@ -48,7 +48,6 @@ validate_ai_source() {
     # Validate AI source
     case "$source" in
         OPENAI|CLAUDE|DEEPSEEK)
-            # Check if API key is set
             api_key_var="${source}_API_KEY"
             if [[ -z "${!api_key_var}" ]]; then
                 echo "Error: ${api_key_var} environment variable is required."
@@ -107,7 +106,7 @@ fi
 if [[ "$GROUP_BY" == "ai" && -z "$WITH_AI" ]]; then
     echo "Error: AI grouping strategy requires specifying an AI source with --with=<source>"
     echo "Available sources: OPENAI, CLAUDE, DEEPSEEK"
-    exit 1
+    usage
 fi
 
 if [[ "$GROUP_BY" != "directory" && "$GROUP_BY" != "extension" && "$GROUP_BY" != "random" && "$GROUP_BY" != "ai" ]]; then
@@ -152,7 +151,7 @@ FILES=$(echo "$PR_DATA" | jq -r '.files[].path')
 TOTAL_FILES=$(echo "$FILES" | wc -l)
 
 echo
-echo "##### PR DETAILS #####"
+echo "##### PR #$PR_NUMBER DETAILS #####"
 echo "- Title: $ORIGINAL_TITLE"
 echo "- Base Branch: $BASE_BRANCH"
 echo "- Head Branch: $HEAD_BRANCH"
@@ -304,6 +303,10 @@ group_files() {
             # Random distribution
             echo "$files" | shuf
             ;;
+        "ai")
+            # AI-powered grouping
+            ask_to_ai "$files" "$WITH_AI"
+            ;;
         *)
             # Default to directory if unknown strategy
             echo "$files" | awk -F'/' '{
@@ -322,10 +325,10 @@ preview_split() {
     local batch_number=1
     local current_batch=""
 
-    echo "Preview of PR split:"
-    echo "-------------------"
-    echo "Using strategy: $GROUP_BY"
-    echo "Maximum files per PR: $batch_size"
+    echo
+    echo "##### PREVIEW #####"
+    echo "- Strategy: $GROUP_BY"
+    echo "- Maximum files per PR: $batch_size"
     echo
 
     while IFS= read -r file; do
@@ -354,8 +357,9 @@ preview_split() {
     echo "Total number of PRs that will be created: $((batch_number))"
 }
 
+echo
 echo "Preparing to split PR into batches of up to $MAX_FILES files..."
-echo "Total files to process: $TOTAL_FILES"
+echo
 
 GROUPED_FILES=$(group_files "$FILES")
 
@@ -436,7 +440,8 @@ Files in this batch: $(echo "$files_list" | wc -l)"
 
     # Create PR or update existing PR
     if [[ "$INPLACE" == false ]]; then
-        local pr_url=$(gh pr create \
+        local pr_url
+        pr_url=$(gh pr create \
             --title "$pr_title" \
             --body "$pr_body" \
             --base "$BASE_BRANCH" \
